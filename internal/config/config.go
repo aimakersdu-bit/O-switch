@@ -23,6 +23,7 @@ type Config struct {
 }
 
 func FromEnv() Config {
+	loadEnvFile(".env")
 	return Config{
 		ListenAddr:            envString("LISTEN_ADDR", "127.0.0.1:11435"),
 		Mode:                  envString("MODE", "anthropic_messages"),
@@ -36,6 +37,33 @@ func FromEnv() Config {
 		MaxConcurrentRequests: envInt("MAX_CONCURRENT_REQUESTS", 1000),
 		MaxConcurrentStreams:  envInt("MAX_CONCURRENT_STREAMS", 1000),
 		RequestTimeout:        time.Duration(envInt("REQUEST_TIMEOUT_SECONDS", 600)) * time.Second,
+	}
+}
+
+func loadEnvFile(filename string) {
+	content, err := os.ReadFile(filename)
+	if err != nil {
+		return
+	}
+	lines := strings.Split(string(content), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key := strings.TrimSpace(parts[0])
+		val := strings.TrimSpace(parts[1])
+		if (strings.HasPrefix(val, "\"") && strings.HasSuffix(val, "\"")) ||
+			(strings.HasPrefix(val, "'") && strings.HasSuffix(val, "'")) {
+			val = val[1 : len(val)-1]
+		}
+		if os.Getenv(key) == "" {
+			_ = os.Setenv(key, val)
+		}
 	}
 }
 
