@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 
 	"baixin-switch/internal/config"
 	"baixin-switch/internal/proxy"
@@ -24,13 +25,27 @@ func main() {
 		os.Exit(0)
 	}
 
+	cfg := config.FromEnv()
+
+	// Parse log level
+	var level slog.Level
+	switch strings.ToLower(cfg.LogLevel) {
+	case "debug":
+		level = slog.LevelDebug
+	case "warn", "warning":
+		level = slog.LevelWarn
+	case "error":
+		level = slog.LevelError
+	default:
+		level = slog.LevelInfo
+	}
+
 	// 设置默认日志输出为 JSON 格式
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
+		Level: level,
 	}))
 	slog.SetDefault(logger)
 
-	cfg := config.FromEnv()
 	server := proxy.NewServer(cfg)
 
 	log.Printf("baixin-switch version: %s, listening on %s", Version, cfg.ListenAddr)

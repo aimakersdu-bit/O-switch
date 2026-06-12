@@ -625,7 +625,7 @@ func (s *Server) handleAnthropicMessagesInbound(w http.ResponseWriter, r *http.R
 		"upstream_url", s.cfg.UpstreamBaseURL + "/v1/chat/completions",
 		"upstream_model", openaiReq.Model,
 	)
-	s.logger.Info("Anthropic payload conversion detail",
+	s.logger.Debug("Anthropic payload conversion detail",
 		"incoming_anthropic_body", string(body),
 	)
 
@@ -642,7 +642,7 @@ func (s *Server) handleAnthropicMessagesInbound(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	s.logger.Info("Anthropic payload conversion detail",
+	s.logger.Debug("Anthropic payload conversion detail",
 		"upstream_openai_body", string(upstreamBody),
 	)
 

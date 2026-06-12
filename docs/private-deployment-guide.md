@@ -48,6 +48,7 @@ Docker 部署：
 | --- | --- | --- | --- |
 | `LISTEN_ADDR` | `127.0.0.1:11435` | 否 | 服务监听地址。内网部署通常设为 `0.0.0.0:11435`。 |
 | `MODE` | `anthropic_messages` | 否 | 默认协议转换模式。旧 OpenAI 透传模式填 `openai_passthrough`。 |
+| `LOG_LEVEL` | `info` | 否 | 日志输出等级（`debug`, `info`, `warn`, `error`）。设为 `debug` 会输出转换前后的详细正文 payload 日志。 |
 | `UPSTREAM_BASE_URL` | `https://api.deepseek.com` | 是 | 上游 base URL，不要带 `/v1/messages`。 |
 | `UPSTREAM_API_KEY` | 空 | 视上游而定 | 发给上游的 token。 |
 | `ANTHROPIC_VERSION` | `2023-06-01` | 否 | Anthropic-compatible 上游版本头。 |
@@ -161,6 +162,32 @@ services:
       - ./logs:/var/log/baixin-switch
 ```
 
+若作为 **Anthropic 入向兼容代理**（客户端请求 Anthropic `POST /v1/messages`，转发至阿里的 OpenAI 兼容端）部署时，`docker-compose.yml` 环境配置示例如下：
+
+```yaml
+services:
+  baixin-switch:
+    image: baixin-switch:latest
+    container_name: baixin-switch
+    restart: unless-stopped
+    ports:
+      - "11435:11435"
+    environment:
+      LISTEN_ADDR: "0.0.0.0:11435"
+      MODE: "openai_passthrough" # 此时 /v1/messages 路由不受此参数限制，但此模式可防误触其他接口
+      UPSTREAM_BASE_URL: "https://dashscope.aliyuncs.com/compatible-mode" # 阿里 DashScope / OpenAI 上游
+      UPSTREAM_API_KEY: "sk-your-ali-api-key"
+      DEFAULT_MODEL: "deepseek-v4-pro"
+      MAX_CONCURRENT_REQUESTS: "1000"
+      MAX_CONCURRENT_STREAMS: "1000"
+      REQUEST_TIMEOUT_SECONDS: "600"
+      AUDIT_ENABLED: "true"
+      AUDIT_LOG_DIR: "/var/log/baixin-switch"
+      AUDIT_CAPTURE_BODY: "preview"
+    volumes:
+      - ./logs:/var/log/baixin-switch
+```
+
 启动：
 
 ```bash
@@ -247,17 +274,14 @@ https://your-ds-pro-anthropic-gateway.example.com/anthropic
 https://your-ds-pro-anthropic-gateway.example.com/v1/messages
 ```
 
-`baixin-switch` 默认会自动请求：
+`baixin-switch` 转发上游接口规则：
 
-```text
-${UPSTREAM_BASE_URL}/v1/messages
-```
+1. **OpenAI 格式请求 (`POST /v1/chat/completions`)**：
+   - 默认模式 (`MODE=anthropic_messages`)：将 OpenAI 格式请求转换为 Anthropic 格式，转发至 `${UPSTREAM_BASE_URL}/v1/messages`。
+   - 透传模式 (`MODE=openai_passthrough`)：作为 OpenAI 协议透明代理（含 DeepSeek V4-Pro/vLLM one-shot 工具流式切分纠正），直接转发至 `${UPSTREAM_BASE_URL}/v1/chat/completions`。
 
-`MODE=openai_passthrough` 时会请求：
-
-```text
-${UPSTREAM_BASE_URL}/v1/chat/completions
-```
+2. **Anthropic 格式请求 (`POST /v1/messages`)**：
+   - 兼容处理：作为 Anthropic 协议入向兼容接口，任何发送至此接口的请求均会自动转换为 OpenAI 格式，并转发至上游的 `${UPSTREAM_BASE_URL}/v1/chat/completions` 接口（例如阿里的 DashScope OpenAI 兼容端）。
 
 ## 9. 上线验证
 

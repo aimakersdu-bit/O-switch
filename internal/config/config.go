@@ -28,6 +28,7 @@ type Config struct {
 	AuditPreviewChars     int
 	AuditQueueSize        int
 	AuditOverflowPolicy   string
+	LogLevel              string
 }
 
 func FromEnv() Config {
@@ -52,6 +53,7 @@ func FromEnv() Config {
 		AuditPreviewChars:     envInt("AUDIT_PREVIEW_CHARS", 2000),
 		AuditQueueSize:        envInt("AUDIT_QUEUE_SIZE", 8192),
 		AuditOverflowPolicy:   envString("AUDIT_OVERFLOW_POLICY", "drop"),
+		LogLevel:              envString("LOG_LEVEL", "info"),
 	}
 }
 
@@ -88,6 +90,9 @@ func (c Config) WithDefaults() Config {
 	}
 	if c.Mode == "" {
 		c.Mode = "anthropic_messages"
+	}
+	if c.LogLevel == "" {
+		c.LogLevel = "info"
 	}
 	c.UpstreamBaseURL = strings.TrimRight(c.UpstreamBaseURL, "/")
 	if c.AnthropicVersion == "" {
