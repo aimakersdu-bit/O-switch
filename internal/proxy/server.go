@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"baixin-switch/internal/anthropic"
 	"baixin-switch/internal/audit"
 	"baixin-switch/internal/config"
 	"baixin-switch/internal/convert"
@@ -116,6 +117,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /readyz", s.handleReady)
 	s.mux.HandleFunc("GET /metrics", s.handleMetrics)
 	s.mux.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
+	s.mux.HandleFunc("POST /v1/messages", s.handleAnthropicMessagesInbound)
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
@@ -534,3 +536,279 @@ func jsonString(payload any) string {
 	}
 	return string(raw)
 }
+
+func (s *Server) handleAnthropicMessagesInbound(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	status := http.StatusOK
+	defer func() {
+		s.metrics.IncHTTPRequests(r.Method, r.URL.Path, status)
+		s.logger.Info("request",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"status", status,
+			"duration_ms", time.Since(start).Milliseconds(),
+			"mode", "anthropic_inbound",
+		)
+	}()
+
+	if !s.requestLimiter.TryAcquire() {
+		status = http.StatusTooManyRequests
+		writeAnthropicError(w, status, "rate_limit_exceeded", "too many active requests")
+		return
+	}
+	defer func() {
+		s.requestLimiter.Release()
+		s.metrics.SetActiveRequests(int64(s.requestLimiter.InUse()))
+	}()
+	s.metrics.SetActiveRequests(int64(s.requestLimiter.InUse()))
+
+	if s.cfg.UpstreamBaseURL == "" {
+		status = http.StatusBadGateway
+		writeAnthropicError(w, status, "upstream_base_url_missing", "UPSTREAM_BASE_URL is required")
+		return
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		status = http.StatusBadRequest
+		return
+	}
+
+	identity := audit.ResolveIdentity(r, body)
+	w.Header().Set("X-Request-ID", identity.RequestID)
+	w.Header().Set("X-Session-ID", identity.SessionID)
+	requestCapture := audit.CaptureBody(body, auditConfigFromServer(s))
+	baseEvent := s.newAuditEvent(identity, r.URL.Path, "/v1/chat/completions", requestCapture, start)
+
+	var anthropicReq anthropic.MessagesRequest
+	if err := json.Unmarshal(body, &anthropicReq); err != nil {
+		s.metrics.IncConversionErrors("anthropic_to_openai_chat", "invalid_request")
+		baseEvent.Status = http.StatusBadRequest
+		baseEvent.ErrorCode = "invalid_request_error"
+		baseEvent.ErrorMessage = err.Error()
+		baseEvent.DurationMs = int(time.Since(start).Milliseconds())
+		s.recordAudit(baseEvent)
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		status = http.StatusBadRequest
+		return
+	}
+
+	baseEvent.Model = anthropicReq.Model
+	baseEvent.Stream = anthropicReq.Stream != nil && *anthropicReq.Stream
+
+	openaiReq, err := convert.AnthropicToOpenAIChatRequest(anthropicReq)
+	if err != nil {
+		s.metrics.IncConversionErrors("anthropic_to_openai_chat", "convert")
+		baseEvent.Status = http.StatusBadRequest
+		baseEvent.ErrorCode = "invalid_request_error"
+		baseEvent.ErrorMessage = err.Error()
+		baseEvent.DurationMs = int(time.Since(start).Milliseconds())
+		s.recordAudit(baseEvent)
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		status = http.StatusBadRequest
+		return
+	}
+
+	// Apply model map / default model
+	originalModel := openaiReq.Model
+	if mapped := s.cfg.ModelMap[originalModel]; mapped != "" {
+		openaiReq.Model = mapped
+	} else if openaiReq.Model == "" {
+		openaiReq.Model = s.cfg.DefaultModel
+	}
+	baseEvent.UpstreamModel = openaiReq.Model
+
+	s.logger.Info("converting Anthropic to OpenAI request",
+		"incoming_path", r.URL.Path,
+		"incoming_model", originalModel,
+		"upstream_url", s.cfg.UpstreamBaseURL + "/v1/chat/completions",
+		"upstream_model", openaiReq.Model,
+	)
+	s.logger.Info("Anthropic payload conversion detail",
+		"incoming_anthropic_body", string(body),
+	)
+
+	upstreamBody, err := json.Marshal(openaiReq)
+	if err != nil {
+		s.metrics.IncConversionErrors("anthropic_to_openai_chat", "marshal")
+		baseEvent.Status = http.StatusInternalServerError
+		baseEvent.ErrorCode = "api_error"
+		baseEvent.ErrorMessage = err.Error()
+		baseEvent.DurationMs = int(time.Since(start).Milliseconds())
+		s.recordAudit(baseEvent)
+		writeAnthropicError(w, http.StatusInternalServerError, "api_error", err.Error())
+		status = http.StatusInternalServerError
+		return
+	}
+
+	s.logger.Info("Anthropic payload conversion detail",
+		"upstream_openai_body", string(upstreamBody),
+	)
+
+	// OpenAI-compatible upstream endpoint is /v1/chat/completions
+	upstreamURL := s.cfg.UpstreamBaseURL + "/v1/chat/completions"
+	upstreamReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(upstreamBody))
+	if err != nil {
+		baseEvent.Status = http.StatusBadGateway
+		baseEvent.ErrorCode = "upstream_request_error"
+		baseEvent.ErrorMessage = err.Error()
+		baseEvent.DurationMs = int(time.Since(start).Milliseconds())
+		s.recordAudit(baseEvent)
+		writeAnthropicError(w, http.StatusBadGateway, "upstream_request_error", err.Error())
+		status = http.StatusBadGateway
+		return
+	}
+
+	upstreamReq.Header.Set("Content-Type", "application/json")
+	if s.cfg.UpstreamAPIKey != "" {
+		upstreamReq.Header.Set("Authorization", "Bearer "+s.cfg.UpstreamAPIKey)
+	}
+
+	resp, err := s.client.Do(upstreamReq)
+	if err != nil {
+		baseEvent.Status = http.StatusBadGateway
+		baseEvent.ErrorCode = "upstream_connection_error"
+		baseEvent.ErrorMessage = err.Error()
+		baseEvent.DurationMs = int(time.Since(start).Milliseconds())
+		s.recordAudit(baseEvent)
+		writeAnthropicError(w, http.StatusBadGateway, "upstream_connection_error", err.Error())
+		status = http.StatusBadGateway
+		return
+	}
+	defer resp.Body.Close()
+	baseEvent.UpstreamStatus = resp.StatusCode
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		raw, _ := io.ReadAll(resp.Body)
+		responseCapture := audit.CaptureBody(raw, auditConfigFromServer(s))
+		baseEvent.ResponsePreview = responseCapture.Preview
+		baseEvent.ResponseBody = responseCapture.Body
+		baseEvent.Truncated = baseEvent.Truncated || responseCapture.Truncated
+		baseEvent.Redacted = baseEvent.Redacted || responseCapture.Redacted
+		baseEvent.Status = resp.StatusCode
+		baseEvent.DurationMs = int(time.Since(start).Milliseconds())
+		baseEvent.UsageSource = audit.UsageSourceMissing
+		s.recordAudit(baseEvent)
+		copyResponseHeaders(w.Header(), resp.Header)
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(raw)
+		status = resp.StatusCode
+		return
+	}
+
+	if isEventStream(resp.Header.Get("Content-Type")) {
+		if !s.streamLimiter.TryAcquire() {
+			writeAnthropicError(w, http.StatusTooManyRequests, "rate_limit_exceeded", "too many active streams")
+			status = http.StatusTooManyRequests
+			return
+		}
+		defer func() {
+			s.streamLimiter.Release()
+			s.metrics.SetActiveStreams(int64(s.streamLimiter.InUse()))
+		}()
+		s.metrics.SetActiveStreams(int64(s.streamLimiter.InUse()))
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+
+		var usage sse.Usage
+		var responseText strings.Builder
+		err := sse.WriteOpenAIToAnthropicStream(w, resp.Body, sse.OpenAIStreamOptions{
+			Model: anthropicReq.Model,
+			OnUsage: func(next sse.Usage) {
+				usage.InputTokens = next.InputTokens
+				usage.OutputTokens = next.OutputTokens
+			},
+			OnTextDelta: func(delta string) {
+				responseText.WriteString(delta)
+			},
+		})
+		if err != nil {
+			s.metrics.IncConversionErrors("openai_chat_stream_to_anthropic", "parse")
+			_, _ = fmt.Fprintf(w, "event: error\ndata: %s\n\n", jsonString(map[string]string{"message": err.Error()}))
+			baseEvent.ErrorCode = "upstream_stream_error"
+			baseEvent.ErrorMessage = err.Error()
+		}
+		responseCapture := audit.CaptureBody([]byte(responseText.String()), auditConfigFromServer(s))
+		baseEvent.Status = http.StatusOK
+		baseEvent.InputTokens = usage.InputTokens
+		baseEvent.OutputTokens = usage.OutputTokens
+		baseEvent.TotalTokens = usage.InputTokens + usage.OutputTokens
+		baseEvent.UsageSource = usageSource(baseEvent.InputTokens, baseEvent.OutputTokens)
+		baseEvent.ResponsePreview = responseCapture.Preview
+		baseEvent.ResponseBody = responseCapture.Body
+		baseEvent.Truncated = baseEvent.Truncated || responseCapture.Truncated
+		baseEvent.Redacted = baseEvent.Redacted || responseCapture.Redacted
+		baseEvent.DurationMs = int(time.Since(start).Milliseconds())
+		s.recordAudit(baseEvent)
+		status = http.StatusOK
+		return
+	}
+
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		baseEvent.Status = http.StatusBadGateway
+		baseEvent.ErrorCode = "upstream_read_error"
+		baseEvent.ErrorMessage = err.Error()
+		baseEvent.DurationMs = int(time.Since(start).Milliseconds())
+		s.recordAudit(baseEvent)
+		writeAnthropicError(w, http.StatusBadGateway, "upstream_read_error", err.Error())
+		status = http.StatusBadGateway
+		return
+	}
+
+	var openaiResp convert.OpenAIChatResponse
+	if err := json.Unmarshal(raw, &openaiResp); err != nil {
+		baseEvent.Status = http.StatusBadGateway
+		baseEvent.ErrorCode = "upstream_response_error"
+		baseEvent.ErrorMessage = err.Error()
+		baseEvent.DurationMs = int(time.Since(start).Milliseconds())
+		s.recordAudit(baseEvent)
+		writeAnthropicError(w, http.StatusBadGateway, "upstream_response_error", err.Error())
+		status = http.StatusBadGateway
+		return
+	}
+
+	anthropicResp, err := convert.OpenAIChatToAnthropicResponse(openaiResp)
+	if err != nil {
+		s.metrics.IncConversionErrors("openai_chat_to_anthropic_response", "convert")
+		baseEvent.Status = http.StatusBadGateway
+		baseEvent.ErrorCode = "upstream_response_error"
+		baseEvent.ErrorMessage = err.Error()
+		baseEvent.DurationMs = int(time.Since(start).Milliseconds())
+		s.recordAudit(baseEvent)
+		writeAnthropicError(w, http.StatusBadGateway, "upstream_response_error", err.Error())
+		status = http.StatusBadGateway
+		return
+	}
+
+	convertedBytes, _ := json.Marshal(anthropicResp)
+	responseCapture := audit.CaptureBody(convertedBytes, auditConfigFromServer(s))
+	baseEvent.Status = http.StatusOK
+	baseEvent.InputTokens = anthropicResp.Usage.InputTokens
+	baseEvent.OutputTokens = anthropicResp.Usage.OutputTokens
+	baseEvent.TotalTokens = anthropicResp.Usage.InputTokens + anthropicResp.Usage.OutputTokens
+	baseEvent.UsageSource = usageSource(baseEvent.InputTokens, baseEvent.OutputTokens)
+	baseEvent.ResponsePreview = responseCapture.Preview
+	baseEvent.ResponseBody = responseCapture.Body
+	baseEvent.Truncated = baseEvent.Truncated || responseCapture.Truncated
+	baseEvent.Redacted = baseEvent.Redacted || responseCapture.Redacted
+	baseEvent.DurationMs = int(time.Since(start).Milliseconds())
+	s.recordAudit(baseEvent)
+
+	copyResponseHeaders(w.Header(), resp.Header)
+	writeJSON(w, http.StatusOK, anthropicResp)
+	status = http.StatusOK
+}
+
+func writeAnthropicError(w http.ResponseWriter, status int, code, message string) {
+	writeJSON(w, status, map[string]any{
+		"type": "error",
+		"error": map[string]string{
+			"type":    code,
+			"message": message,
+		},
+	})
+}
+
