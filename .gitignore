@@ -1,3 +1,4 @@
 .cache/
-baixin-switch
+/baixin-switch
 .env
+dist/
