@@ -35,47 +35,54 @@
 
 ## Task 1: IR and Request Conversion
 
-- [ ] Write failing tests in `internal/convert/convert_test.go` covering OpenAI Chat messages/tools/tool results -> IR -> Anthropic Messages.
-- [ ] Run `go test ./internal/convert` and verify it fails due to missing package.
-- [ ] Implement `internal/ir/types.go`, `internal/anthropic/types.go`, and request converters.
-- [ ] Run `go test ./internal/convert` and verify it passes.
+- [x] Write failing tests in `internal/convert/convert_test.go` covering OpenAI Chat messages/tools/tool results -> IR -> Anthropic Messages.
+- [x] Run `go test ./internal/convert` and verify it fails due to missing package.
+- [x] Implement `internal/ir/types.go`, `internal/anthropic/types.go`, and request converters.
+- [x] Run `go test ./internal/convert` and verify it passes.
 
 ## Task 2: Anthropic Response Conversion
 
-- [ ] Add failing tests for Anthropic non-streaming text/tool_use response -> OpenAI Chat response.
-- [ ] Run `go test ./internal/convert` and verify expected failure.
-- [ ] Implement non-streaming response conversion.
-- [ ] Run `go test ./internal/convert` and verify it passes.
+- [x] Add failing tests for Anthropic non-streaming text/tool_use response -> OpenAI Chat response.
+- [x] Run `go test ./internal/convert` and verify expected failure.
+- [x] Implement non-streaming response conversion.
+- [x] Run `go test ./internal/convert` and verify it passes.
 
 ## Task 3: Anthropic SSE -> OpenAI Chat SSE
 
-- [ ] Add failing tests in `internal/sse/anthropic_chat_test.go` for text delta and tool input_json_delta conversion.
-- [ ] Run `go test ./internal/sse` and verify expected failure.
-- [ ] Implement streaming translator that reads Anthropic SSE blocks and writes OpenAI Chat SSE blocks incrementally.
-- [ ] Run `go test ./internal/sse` and verify it passes.
+- [x] Add failing tests in `internal/sse/anthropic_chat_test.go` for text delta and tool input_json_delta conversion.
+- [x] Run `go test ./internal/sse` and verify expected failure.
+- [x] Implement streaming translator that reads Anthropic SSE blocks and writes OpenAI Chat SSE blocks incrementally.
+- [x] Run `go test ./internal/sse` and verify it passes.
 
 ## Task 4: Observability and Limits
 
-- [ ] Add failing tests for limiter 429 behavior and metrics rendering.
-- [ ] Run `go test ./internal/limits ./internal/observability` and verify expected failure.
-- [ ] Implement simple atomic metrics registry and semaphore limiter.
-- [ ] Run `go test ./internal/limits ./internal/observability` and verify it passes.
+- [x] Add failing tests for limiter 429 behavior and metrics rendering.
+- [x] Run `go test ./internal/limits ./internal/observability` and verify expected failure.
+- [x] Implement simple atomic metrics registry and semaphore limiter.
+- [x] Run `go test ./internal/limits ./internal/observability` and verify it passes.
 
 ## Task 5: HTTP Integration
 
-- [ ] Add failing proxy tests with fake Anthropic upstream:
+- [x] Add failing proxy tests with fake Anthropic upstream:
   - non-streaming Chat request becomes Anthropic `/v1/messages`;
   - streaming Anthropic response becomes OpenAI Chat SSE;
   - `/metrics`, `/healthz`, `/readyz` work;
   - limiter returns 429.
-- [ ] Run `go test ./internal/proxy` and verify expected failure.
-- [ ] Update proxy server to route by `MODE`:
+- [x] Run `go test ./internal/proxy` and verify expected failure.
+- [x] Update proxy server to route by `MODE`:
   - `anthropic_messages`: OpenAI Chat -> Anthropic Messages;
   - `openai_passthrough`: existing passthrough + DS Pro shim.
-- [ ] Run `go test ./internal/proxy` and verify it passes.
+- [x] Run `go test ./internal/proxy` and verify it passes.
 
 ## Task 6: Docs and Verification
 
-- [ ] Update README and manuals for `MODE=anthropic_messages`.
-- [ ] Run `go test ./...`.
-- [ ] Run `go build ./cmd/baixin-switch`.
+- [x] Update README and manuals for `MODE=anthropic_messages`.
+- [x] Run `go test ./...`.
+- [x] Run `go build ./cmd/baixin-switch`.
+
+## Notes After Task 5
+
+- `MODE=anthropic_messages` is now the default.
+- `MODE=openai_passthrough` preserves the original DS Pro one-shot tool-call stream shim.
+- Anthropic SSE conversion has a writer-based streaming path used by the proxy.
+- The legacy passthrough normalizer still buffers full SSE output; keep this in mind if passthrough mode also needs 1000 long-lived streams.

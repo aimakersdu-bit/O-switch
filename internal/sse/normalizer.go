@@ -27,7 +27,7 @@ func NormalizeChatCompletionStream(r io.Reader, opts Options) (string, error) {
 	}
 
 	state := normalizerState{
-		opts:          opts,
+		opts:         opts,
 		seenToolMeta: map[string]bool{},
 	}
 	var out strings.Builder
@@ -44,7 +44,7 @@ func NormalizeChatCompletionStream(r io.Reader, opts Options) (string, error) {
 }
 
 type normalizerState struct {
-	opts          Options
+	opts         Options
 	seenToolMeta map[string]bool
 }
 

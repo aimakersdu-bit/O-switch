@@ -2,54 +2,60 @@
 
 ## 1. 部署目标
 
-`baixin-switch` 是一个内部 OpenAI Chat Completions 兼容代理，主要解决 DS Pro 在流式工具调用中一次性返回完整 `function.arguments`，导致 Comate 等内部编程助手无法消费的问题。
-
-部署后，调用链为：
+`baixin-switch` 默认作为 OpenAI-compatible 到 Anthropic Messages 的私有化协议网关：
 
 ```text
 Comate / OpenAI-compatible client
-  -> baixin-switch
-  -> 内部 DS Pro / vLLM / OpenAI-compatible gateway
+  -> baixin-switch /v1/chat/completions
+  -> 内部 DS Pro Anthropic-compatible gateway /v1/messages
 ```
 
 当前版本支持：
 
-- `GET /health`
-- `POST /v1/chat/completions`
-- 流式 `text/event-stream` 响应
-- DS Pro one-shot tool call arguments -> OpenAI incremental tool call delta
-- 非流式响应透传
+- OpenAI Chat Completions -> Anthropic Messages
+- 非流式和流式响应
+- OpenAI tools/tool_choice/tool messages 与 Anthropic tool_use/tool_result 转换
+- `/healthz`、`/readyz`、`/metrics`
+- JSON access log
+- 单实例进程内并发限流，默认 1000 active requests / 1000 active streams
+- `MODE=openai_passthrough` 兼容旧 DS Pro OpenAI-compatible 流式工具调用修正
 
 当前版本不支持：
 
 - `/v1/responses`
-- Anthropic Messages API 转换
-- 多上游故障转移
-- 内置鉴权
+- 多上游自动故障转移
+- 内置客户端鉴权
+- 请求正文落库审计
 
 ## 2. 环境要求
 
-### 二进制部署
+二进制部署：
 
 - Go 1.22 或以上
-- 可以访问内部 DS Pro 网关
-- 运行机器开放本地或内网端口，例如 `11435`
+- 可以访问内部 Anthropic Messages-compatible 上游
+- 建议运行机器 `ulimit -n` 不低于 `8192`
 
-### Docker 部署
+Docker 部署：
 
 - Docker 20+ 或兼容运行时
-- 可以从运行容器访问内部 DS Pro 网关
+- 容器可以访问内部上游
 
 ## 3. 配置项
 
 | 变量 | 默认值 | 必填 | 说明 |
 | --- | --- | --- | --- |
-| `LISTEN_ADDR` | `127.0.0.1:11435` | 否 | 服务监听地址。私有化内网部署通常设为 `0.0.0.0:11435`。 |
-| `UPSTREAM_BASE_URL` | `https://api.deepseek.com` | 是 | 上游 OpenAI-compatible 网关 base URL，不要带 `/v1/chat/completions`。 |
-| `UPSTREAM_API_KEY` | 空 | 视上游而定 | 发给上游的 Bearer Token。 |
-| `TOOL_CALL_STREAM_SHIM` | `true` | 否 | 是否启用 DS Pro 工具调用流式兼容。 |
-| `TOOL_CALL_ARGUMENT_CHUNK_SIZE` | `16` | 否 | 每个 arguments delta 的 rune 数。Comate 兼容性验证可调小到 `5`。 |
-| `REQUEST_TIMEOUT_SECONDS` | `600` | 否 | 上游请求超时时间。 |
+| `LISTEN_ADDR` | `127.0.0.1:11435` | 否 | 服务监听地址。内网部署通常设为 `0.0.0.0:11435`。 |
+| `MODE` | `anthropic_messages` | 否 | 默认协议转换模式。旧 OpenAI 透传模式填 `openai_passthrough`。 |
+| `UPSTREAM_BASE_URL` | `https://api.deepseek.com` | 是 | 上游 base URL，不要带 `/v1/messages`。 |
+| `UPSTREAM_API_KEY` | 空 | 视上游而定 | 发给上游的 token。 |
+| `ANTHROPIC_VERSION` | `2023-06-01` | 否 | Anthropic-compatible 上游版本头。 |
+| `DEFAULT_MODEL` | `deepseek-v4-pro` | 否 | OpenAI 请求未传 `model` 时使用。 |
+| `MODEL_MAP` | 空 | 否 | 模型映射，例如 `gpt-4.1=deepseek-v4-pro,claude-sonnet=deepseek-v4-pro`。 |
+| `MAX_CONCURRENT_REQUESTS` | `1000` | 否 | 单进程 active request 上限，超出返回 429。 |
+| `MAX_CONCURRENT_STREAMS` | `1000` | 否 | 单进程 active stream 上限，超出返回 429。 |
+| `REQUEST_TIMEOUT_SECONDS` | `600` | 否 | 上游请求超时。 |
+| `TOOL_CALL_STREAM_SHIM` | `true` | 否 | 仅 `openai_passthrough` 使用。 |
+| `TOOL_CALL_ARGUMENT_CHUNK_SIZE` | `16` | 否 | 仅 `openai_passthrough` 使用。 |
 
 ## 4. 源码构建
 
@@ -63,23 +69,21 @@ GOCACHE="$(pwd)/.cache/go-build" go build -o baixin-switch ./cmd/baixin-switch
 
 ```bash
 export LISTEN_ADDR="0.0.0.0:11435"
-export UPSTREAM_BASE_URL="https://your-ds-pro-gateway.example.com"
+export MODE="anthropic_messages"
+export UPSTREAM_BASE_URL="https://your-ds-pro-anthropic-gateway.example.com"
 export UPSTREAM_API_KEY="sk-..."
-export TOOL_CALL_STREAM_SHIM="true"
-export TOOL_CALL_ARGUMENT_CHUNK_SIZE="16"
+export DEFAULT_MODEL="deepseek-v4-pro"
+export MAX_CONCURRENT_REQUESTS="1000"
+export MAX_CONCURRENT_STREAMS="1000"
 ./baixin-switch
 ```
 
-健康检查：
+探针：
 
 ```bash
-curl -sS http://127.0.0.1:11435/health
-```
-
-期望返回：
-
-```json
-{"service":"baixin-switch","status":"ok"}
+curl -sS http://127.0.0.1:11435/healthz
+curl -sS http://127.0.0.1:11435/readyz
+curl -sS http://127.0.0.1:11435/metrics
 ```
 
 ## 5. Docker 部署
@@ -99,10 +103,12 @@ docker run -d \
   --restart unless-stopped \
   -p 11435:11435 \
   -e LISTEN_ADDR=0.0.0.0:11435 \
-  -e UPSTREAM_BASE_URL=https://your-ds-pro-gateway.example.com \
+  -e MODE=anthropic_messages \
+  -e UPSTREAM_BASE_URL=https://your-ds-pro-anthropic-gateway.example.com \
   -e UPSTREAM_API_KEY=sk-... \
-  -e TOOL_CALL_STREAM_SHIM=true \
-  -e TOOL_CALL_ARGUMENT_CHUNK_SIZE=16 \
+  -e DEFAULT_MODEL=deepseek-v4-pro \
+  -e MAX_CONCURRENT_REQUESTS=1000 \
+  -e MAX_CONCURRENT_STREAMS=1000 \
   baixin-switch:latest
 ```
 
@@ -110,19 +116,10 @@ docker run -d \
 
 ```bash
 docker logs -f baixin-switch
-curl -sS http://127.0.0.1:11435/health
-```
-
-停止：
-
-```bash
-docker stop baixin-switch
-docker rm baixin-switch
+curl -sS http://127.0.0.1:11435/readyz
 ```
 
 ## 6. docker-compose 示例
-
-创建 `docker-compose.yml`：
 
 ```yaml
 services:
@@ -134,10 +131,12 @@ services:
       - "11435:11435"
     environment:
       LISTEN_ADDR: "0.0.0.0:11435"
-      UPSTREAM_BASE_URL: "https://your-ds-pro-gateway.example.com"
+      MODE: "anthropic_messages"
+      UPSTREAM_BASE_URL: "https://your-ds-pro-anthropic-gateway.example.com"
       UPSTREAM_API_KEY: "sk-..."
-      TOOL_CALL_STREAM_SHIM: "true"
-      TOOL_CALL_ARGUMENT_CHUNK_SIZE: "16"
+      DEFAULT_MODEL: "deepseek-v4-pro"
+      MAX_CONCURRENT_REQUESTS: "1000"
+      MAX_CONCURRENT_STREAMS: "1000"
       REQUEST_TIMEOUT_SECONDS: "600"
 ```
 
@@ -160,10 +159,12 @@ docker compose logs -f
 
 ```bash
 LISTEN_ADDR=0.0.0.0:11435
-UPSTREAM_BASE_URL=https://your-ds-pro-gateway.example.com
+MODE=anthropic_messages
+UPSTREAM_BASE_URL=https://your-ds-pro-anthropic-gateway.example.com
 UPSTREAM_API_KEY=sk-...
-TOOL_CALL_STREAM_SHIM=true
-TOOL_CALL_ARGUMENT_CHUNK_SIZE=16
+DEFAULT_MODEL=deepseek-v4-pro
+MAX_CONCURRENT_REQUESTS=1000
+MAX_CONCURRENT_STREAMS=1000
 REQUEST_TIMEOUT_SECONDS=600
 ```
 
@@ -171,7 +172,7 @@ REQUEST_TIMEOUT_SECONDS=600
 
 ```ini
 [Unit]
-Description=baixin-switch OpenAI-compatible proxy
+Description=baixin-switch OpenAI to Anthropic gateway
 After=network-online.target
 Wants=network-online.target
 
@@ -184,6 +185,7 @@ Restart=always
 RestartSec=3
 User=baixin
 Group=baixin
+LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
@@ -205,22 +207,28 @@ journalctl -u baixin-switch -f
 
 ## 8. 上游地址规则
 
-`UPSTREAM_BASE_URL` 必须是 base URL：
+`UPSTREAM_BASE_URL` 必须是 base URL。
 
 正确：
 
 ```text
-https://your-ds-pro-gateway.example.com
-https://your-ds-pro-gateway.example.com/openai
+https://your-ds-pro-anthropic-gateway.example.com
+https://your-ds-pro-anthropic-gateway.example.com/anthropic
 ```
 
 错误：
 
 ```text
-https://your-ds-pro-gateway.example.com/v1/chat/completions
+https://your-ds-pro-anthropic-gateway.example.com/v1/messages
 ```
 
-`baixin-switch` 会自动请求：
+`baixin-switch` 默认会自动请求：
+
+```text
+${UPSTREAM_BASE_URL}/v1/messages
+```
+
+`MODE=openai_passthrough` 时会请求：
 
 ```text
 ${UPSTREAM_BASE_URL}/v1/chat/completions
@@ -228,13 +236,7 @@ ${UPSTREAM_BASE_URL}/v1/chat/completions
 
 ## 9. 上线验证
 
-### 健康检查
-
-```bash
-curl -sS http://127.0.0.1:11435/health
-```
-
-### 非流式请求
+非流式请求：
 
 ```bash
 curl -sS http://127.0.0.1:11435/v1/chat/completions \
@@ -249,61 +251,46 @@ curl -sS http://127.0.0.1:11435/v1/chat/completions \
   }'
 ```
 
-### 流式工具调用验证
-
-用 Comate 或内部压测脚本发起带 tools 的流式请求。观察返回：
-
-- `tool_calls[0].id/type/function.name` 只在第一帧出现；
-- `tool_calls[0].function.arguments` 在多帧中逐步追加；
-- 最终帧保留 `finish_reason: "tool_calls"`；
-- 最后保留 `data: [DONE]`。
-
-## 10. 回滚
-
-客户端可以直接切回原上游：
-
-```text
-https://your-ds-pro-gateway.example.com/v1
-```
-
-服务端回滚：
+流式请求：
 
 ```bash
-docker stop baixin-switch
+curl -N http://127.0.0.1:11435/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer dummy-client-key' \
+  -d '{
+    "model": "deepseek-v4-pro",
+    "messages": [
+      {"role": "user", "content": "你好"}
+    ],
+    "stream": true
+  }'
 ```
 
-或：
+观测检查：
 
 ```bash
-sudo systemctl stop baixin-switch
+curl -sS http://127.0.0.1:11435/metrics | grep baixin
 ```
 
-## 11. 排障
+关键指标：
 
-### Comate 仍然不能调用工具
+- `baixin_http_requests_total`
+- `baixin_conversion_errors_total`
+- `baixin_active_requests`
+- `baixin_active_streams`
 
-检查：
+## 10. 1000 并发建议
 
-- Comate base URL 是否配置为 `http://<baixin-switch-host>:11435/v1`；
-- 请求是否为 `stream: true`；
-- `TOOL_CALL_STREAM_SHIM` 是否为 `true`；
-- 上游返回是否是 `text/event-stream`；
-- 上游是否真的返回了 `tool_calls[].function.arguments`。
+单实例 1000 并发可行性取决于上游延迟、流式请求占比、机器文件描述符和网络带宽。当前实现已经做了：
 
-可以临时调小：
+- active request limiter 默认 1000
+- active stream limiter 默认 1000
+- 上游 HTTP connection pool 按并发上限配置
+- Anthropic SSE 主路径边读边写，不缓存完整流
 
-```bash
-TOOL_CALL_ARGUMENT_CHUNK_SIZE=5
-```
+上线前建议：
 
-### 上游返回 401
-
-检查 `UPSTREAM_API_KEY`。客户端传给 `baixin-switch` 的 Authorization 不会原样转发；如果配置了 `UPSTREAM_API_KEY`，代理会使用它覆盖上游 Authorization。
-
-### 请求路径 404
-
-检查 `UPSTREAM_BASE_URL` 是否多写了 `/v1/chat/completions`。该变量只能写 base URL。
-
-### 首个工具调用仍然等待很久
-
-这是预期限制。代理只能把已经收到的一次性完整 `arguments` 拆成增量返回，不能让旧版 vLLM 提前吐出尚未生成的参数。长期修复仍然是升级 vLLM 到 `v0.22.0+` 或 cherry-pick vLLM PR `#42879`。
+- `ulimit -n >= 8192`
+- 容器或 systemd 配置 `LimitNOFILE=65535`
+- 先用 100、300、600、1000 梯度压测
+- 观察 429、上游 5xx、P95/P99 延迟、CPU、内存、连接数

@@ -37,7 +37,7 @@ func NewServer(cfg config.Config) *Server {
 func NewServerWithClient(cfg config.Config, client *http.Client) *Server {
 	cfg = cfg.WithDefaults()
 	if client == nil {
-		client = &http.Client{Timeout: cfg.RequestTimeout}
+		client = newUpstreamClient(cfg)
 	}
 	s := &Server{
 		cfg:            cfg,

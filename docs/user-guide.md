@@ -2,13 +2,21 @@
 
 ## 1. 适用场景
 
-`baixin-switch` 用于让 Comate 或其他 OpenAI-compatible 编程助手稳定接入内部 DS Pro 服务。
+`baixin-switch` 让 Comate 或其他 OpenAI-compatible 编程助手用 OpenAI Chat Completions 方式接入内部 DS Pro Anthropic-compatible 服务。
 
-它解决的问题是：
+客户端看到的是：
 
-- DS Pro 某些部署在流式工具调用时，一次性返回完整 `function.arguments`；
-- Comate 期望 OpenAI 风格的增量 `function.arguments` delta；
-- `baixin-switch` 在中间把一次性工具参数拆成多段流式 delta。
+```http
+POST /v1/chat/completions
+```
+
+上游实际收到的是：
+
+```http
+POST /v1/messages
+```
+
+这就是当前默认的 `MODE=anthropic_messages`。
 
 ## 2. 客户端配置
 
@@ -18,7 +26,7 @@
 http://<baixin-switch-host>:11435/v1
 ```
 
-本机测试时：
+本机测试：
 
 ```text
 http://127.0.0.1:11435/v1
@@ -26,9 +34,15 @@ http://127.0.0.1:11435/v1
 
 API Key：
 
-- 如果客户端必须填写，可以填任意占位值，例如 `dummy`；
 - 当前版本默认不校验客户端 API Key；
-- 上游 API Key 由服务端环境变量 `UPSTREAM_API_KEY` 控制。
+- 如果客户端必须填写，可以填 `dummy`；
+- 真正发给上游的 key 来自服务端环境变量 `UPSTREAM_API_KEY`。
+
+模型：
+
+- 客户端可以传 `model`；
+- 如果不传，服务端使用 `DEFAULT_MODEL`；
+- 如需把客户端模型名改成上游模型名，用 `MODEL_MAP`。
 
 ## 3. 支持的接口
 
@@ -36,12 +50,19 @@ API Key：
 
 ```http
 GET /health
+GET /healthz
 ```
 
-返回：
+### 就绪检查
 
-```json
-{"service":"baixin-switch","status":"ok"}
+```http
+GET /readyz
+```
+
+### 指标
+
+```http
+GET /metrics
 ```
 
 ### Chat Completions
@@ -57,9 +78,15 @@ POST /v1/chat/completions
 - `messages`
 - `tools`
 - `tool_choice`
-- 其他字段透传给上游
+- `max_tokens`
+- `max_completion_tokens`
+- `temperature`
+- `top_p`
+- `stop`
 
 ## 4. 普通对话示例
+
+客户端请求：
 
 ```bash
 curl -sS http://127.0.0.1:11435/v1/chat/completions \
@@ -68,13 +95,62 @@ curl -sS http://127.0.0.1:11435/v1/chat/completions \
   -d '{
     "model": "deepseek-v4-pro",
     "messages": [
+      {"role": "system", "content": "你是一个简洁的编程助手"},
       {"role": "user", "content": "用一句话介绍你自己"}
     ],
     "stream": false
   }'
 ```
 
+`baixin-switch` 会转换为 Anthropic Messages：
+
+```json
+{
+  "model": "deepseek-v4-pro",
+  "max_tokens": 4096,
+  "system": "你是一个简洁的编程助手",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "用一句话介绍你自己"}
+      ]
+    }
+  ],
+  "stream": false
+}
+```
+
+返回给客户端的仍是 OpenAI Chat Completions 响应。
+
 ## 5. 流式请求示例
+
+```bash
+curl -N http://127.0.0.1:11435/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer dummy' \
+  -d '{
+    "model": "deepseek-v4-pro",
+    "messages": [
+      {"role": "user", "content": "查询北京天气"}
+    ],
+    "stream": true
+  }'
+```
+
+上游 Anthropic SSE 会被转换为 OpenAI Chat SSE：
+
+```text
+data: {"object":"chat.completion.chunk","choices":[{"delta":{"role":"assistant"}}]}
+
+data: {"object":"chat.completion.chunk","choices":[{"delta":{"content":"..."}}]}
+
+data: {"object":"chat.completion.chunk","choices":[{"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+```
+
+## 6. 工具调用示例
 
 ```bash
 curl -N http://127.0.0.1:11435/v1/chat/completions \
@@ -106,23 +182,19 @@ curl -N http://127.0.0.1:11435/v1/chat/completions \
   }'
 ```
 
-期望工具调用返回形态：
+工具调用映射：
 
-```text
-data: ... "tool_calls":[{"index":0,"id":"call_xxx","type":"function","function":{"name":"get_weather","arguments":""}}] ...
+| OpenAI Chat | Anthropic Messages |
+| --- | --- |
+| `tools[].function.name` | `tools[].name` |
+| `tools[].function.parameters` | `tools[].input_schema` |
+| `assistant.tool_calls[]` | `assistant.content[].tool_use` |
+| `role=tool` | `user.content[].tool_result` |
+| `finish_reason=tool_calls` | `stop_reason=tool_use` |
 
-data: ... "tool_calls":[{"index":0,"function":{"arguments":"{\"city\""}}] ...
+## 7. Comate 接入步骤
 
-data: ... "tool_calls":[{"index":0,"function":{"arguments":":\"北京\"}"}}] ...
-
-data: ... "finish_reason":"tool_calls" ...
-
-data: [DONE]
-```
-
-## 6. Comate 接入步骤
-
-1. 运维部署 `baixin-switch`，确认 `/health` 正常。
+1. 部署 `baixin-switch`，确认 `/readyz` 正常。
 2. 在 Comate 的 OpenAI-compatible 配置中填写：
 
 ```text
@@ -131,88 +203,67 @@ API Key: dummy
 Model: deepseek-v4-pro
 ```
 
-3. 发起一次需要工具调用的任务。
-4. 确认 Comate 能收到工具调用、执行工具、继续后续对话。
+3. 发起一次普通对话，确认非流式响应正常。
+4. 发起一次工具调用任务，确认 Comate 能收到工具调用、执行工具、继续后续对话。
+5. 查看 `/metrics` 和服务日志，确认没有 conversion error。
 
-## 7. 常用调试方法
+## 8. 兼容旧 DS Pro OpenAI passthrough
 
-### 检查服务是否可访问
+如果你的上游仍是 OpenAI-compatible `/v1/chat/completions`，并且只需要修复 DS Pro 一次性 tool call SSE，可以用：
 
 ```bash
-curl -sS http://<baixin-switch-host>:11435/health
+MODE=openai_passthrough
+TOOL_CALL_STREAM_SHIM=true
 ```
 
-### 检查客户端是否走代理
+此时请求链路变成：
 
-把 Comate base URL 临时改成一个错误端口，确认请求失败；再改回 `baixin-switch` 地址确认恢复。
+```text
+Comate / OpenAI-compatible client
+  -> baixin-switch /v1/chat/completions
+  -> OpenAI-compatible upstream /v1/chat/completions
+```
 
-### 检查上游是否可用
+如果上游已经像 GLM 5.1 一样逐段返回 `function.arguments`，代理会原样透传。
 
-在部署机器上直接请求上游：
+## 9. 常用调试方法
+
+检查服务：
 
 ```bash
-curl -sS "$UPSTREAM_BASE_URL/v1/chat/completions" \
+curl -sS http://<baixin-switch-host>:11435/readyz
+curl -sS http://<baixin-switch-host>:11435/metrics
+```
+
+检查上游：
+
+```bash
+curl -sS "$UPSTREAM_BASE_URL/v1/messages" \
   -H 'Content-Type: application/json' \
   -H "Authorization: Bearer $UPSTREAM_API_KEY" \
+  -H 'anthropic-version: 2023-06-01' \
   -d '{
     "model": "deepseek-v4-pro",
-    "messages": [{"role": "user", "content": "ping"}],
-    "stream": false
+    "max_tokens": 128,
+    "messages": [
+      {"role": "user", "content": [{"type": "text", "text": "ping"}]}
+    ]
   }'
 ```
 
-### 调整工具参数拆分大小
+排障顺序：
 
-如果 Comate 对 chunk 更敏感，可以调小：
+1. `/readyz` 是否正常。
+2. Comate base URL 是否是 `http://<host>:11435/v1`。
+3. `MODE` 是否是预期值。
+4. `UPSTREAM_BASE_URL` 是否不带 `/v1/messages`。
+5. `UPSTREAM_API_KEY` 是否正确。
+6. `/metrics` 是否出现 `baixin_conversion_errors_total` 增长。
+7. 服务日志里的 `status`、`duration_ms`、`mode` 是否符合预期。
 
-```bash
-TOOL_CALL_ARGUMENT_CHUNK_SIZE=5
-```
-
-如果希望减少 chunk 数量，可以调大：
-
-```bash
-TOOL_CALL_ARGUMENT_CHUNK_SIZE=32
-```
-
-## 8. 行为说明
-
-### 已经流式返回的模型
-
-如果上游已经像 GLM 5.1 一样逐段返回 `function.arguments`，`baixin-switch` 会原样透传，不会二次拆分。
-
-### 一次性返回的 DS Pro
-
-如果上游一次性返回：
-
-```json
-{"function":{"name":"get_weather","arguments":"{\"city\":\"北京\"}"}}
-```
-
-代理会改成：
-
-- 第一帧：工具 id/type/name + 空 arguments；
-- 后续多帧：只追加 arguments 片段；
-- 结束帧：`finish_reason: "tool_calls"`。
-
-### 延迟限制
-
-如果旧版 vLLM 本身等完整工具参数生成后才发第一帧，`baixin-switch` 无法消除这段等待。它只负责把收到后的格式改成 Comate 可消费的流式格式。
-
-## 9. 当前限制
+## 10. 当前限制
 
 - 不做客户端 API Key 校验。
-- 不支持 `/v1/responses`。
-- 不支持 Anthropic Messages 协议输入。
-- 不支持多上游自动故障转移。
-- 不记录请求日志到数据库。
-
-## 10. 推荐排障顺序
-
-1. `/health` 是否正常。
-2. Comate base URL 是否是 `http://<host>:11435/v1`。
-3. `UPSTREAM_BASE_URL` 是否不带 `/v1/chat/completions`。
-4. `UPSTREAM_API_KEY` 是否正确。
-5. 请求是否开启 `stream: true`。
-6. 上游响应 `Content-Type` 是否是 `text/event-stream`。
-7. `TOOL_CALL_STREAM_SHIM` 是否为 `true`。
+- 暂不支持 `/v1/responses`。
+- 暂不支持多上游自动故障转移。
+- Anthropic SSE 主路径已经边读边写；旧 `openai_passthrough` DS Pro shim 仍会缓存完整上游 SSE 再输出，后续可以继续改造成 writer 流式。
