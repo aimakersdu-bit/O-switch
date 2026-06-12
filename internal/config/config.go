@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -20,6 +21,13 @@ type Config struct {
 	MaxConcurrentRequests int
 	MaxConcurrentStreams  int
 	RequestTimeout        time.Duration
+	AuditEnabled          bool
+	AuditLogDir           string
+	AuditLogPath          string
+	AuditCaptureBody      string
+	AuditPreviewChars     int
+	AuditQueueSize        int
+	AuditOverflowPolicy   string
 }
 
 func FromEnv() Config {
@@ -37,6 +45,13 @@ func FromEnv() Config {
 		MaxConcurrentRequests: envInt("MAX_CONCURRENT_REQUESTS", 1000),
 		MaxConcurrentStreams:  envInt("MAX_CONCURRENT_STREAMS", 1000),
 		RequestTimeout:        time.Duration(envInt("REQUEST_TIMEOUT_SECONDS", 600)) * time.Second,
+		AuditEnabled:          envBool("AUDIT_ENABLED", true),
+		AuditLogDir:           envString("AUDIT_LOG_DIR", "./logs"),
+		AuditLogPath:          strings.TrimSpace(os.Getenv("AUDIT_LOG_PATH")),
+		AuditCaptureBody:      envString("AUDIT_CAPTURE_BODY", "preview"),
+		AuditPreviewChars:     envInt("AUDIT_PREVIEW_CHARS", 2000),
+		AuditQueueSize:        envInt("AUDIT_QUEUE_SIZE", 8192),
+		AuditOverflowPolicy:   envString("AUDIT_OVERFLOW_POLICY", "drop"),
 	}
 }
 
@@ -95,6 +110,41 @@ func (c Config) WithDefaults() Config {
 	}
 	if c.RequestTimeout <= 0 {
 		c.RequestTimeout = 600 * time.Second
+	}
+	if !c.AuditEnabled && c.AuditLogPath == "" {
+		c.AuditEnabled = true
+	}
+	if c.AuditLogDir == "" {
+		c.AuditLogDir = "./logs"
+	}
+	if c.AuditLogPath == "" {
+		if c.AuditLogDir == "./logs" {
+			c.AuditLogPath = "./logs/usage.jsonl"
+		} else {
+			c.AuditLogPath = filepath.Join(c.AuditLogDir, "usage.jsonl")
+		}
+	}
+	if c.AuditCaptureBody == "" {
+		c.AuditCaptureBody = "preview"
+	}
+	switch c.AuditCaptureBody {
+	case "off", "preview", "full":
+	default:
+		c.AuditCaptureBody = "preview"
+	}
+	if c.AuditPreviewChars <= 0 {
+		c.AuditPreviewChars = 2000
+	}
+	if c.AuditQueueSize <= 0 {
+		c.AuditQueueSize = 8192
+	}
+	if c.AuditOverflowPolicy == "" {
+		c.AuditOverflowPolicy = "drop"
+	}
+	switch c.AuditOverflowPolicy {
+	case "drop", "sync":
+	default:
+		c.AuditOverflowPolicy = "drop"
 	}
 	return c
 }

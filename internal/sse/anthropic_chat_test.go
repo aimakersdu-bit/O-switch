@@ -45,18 +45,30 @@ func TestAnthropicToOpenAIChatStreamText(t *testing.T) {
 func TestWriteAnthropicToOpenAIChatStreamText(t *testing.T) {
 	input := strings.Join([]string{
 		`event: message_start`,
-		`data: {"type":"message_start","message":{"id":"msg_1","model":"deepseek-v4-pro"}}`,
+		`data: {"type":"message_start","message":{"id":"msg_1","model":"deepseek-v4-pro","usage":{"input_tokens":5}}}`,
 		``,
 		`event: content_block_delta`,
 		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}`,
 		``,
 		`event: message_delta`,
-		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}`,
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}`,
 		``,
 	}, "\n")
 
 	var out strings.Builder
-	err := WriteAnthropicToOpenAIChatStream(&out, strings.NewReader(input), ChatStreamOptions{ResponseID: "chatcmpl-1", Model: "deepseek-v4-pro"})
+	var usage Usage
+	var text strings.Builder
+	err := WriteAnthropicToOpenAIChatStream(&out, strings.NewReader(input), ChatStreamOptions{
+		ResponseID: "chatcmpl-1",
+		Model:      "deepseek-v4-pro",
+		OnUsage: func(next Usage) {
+			usage.InputTokens += next.InputTokens
+			usage.OutputTokens += next.OutputTokens
+		},
+		OnTextDelta: func(delta string) {
+			text.WriteString(delta)
+		},
+	})
 	if err != nil {
 		t.Fatalf("WriteAnthropicToOpenAIChatStream returned error: %v", err)
 	}
@@ -69,6 +81,12 @@ func TestWriteAnthropicToOpenAIChatStreamText(t *testing.T) {
 	}
 	if !strings.Contains(output, "data: [DONE]") {
 		t.Fatalf("expected done:\n%s", output)
+	}
+	if usage.InputTokens != 5 || usage.OutputTokens != 2 {
+		t.Fatalf("expected usage callback input=5 output=2, got %#v", usage)
+	}
+	if text.String() != "hello" {
+		t.Fatalf("expected text callback hello, got %q", text.String())
 	}
 }
 

@@ -11,8 +11,15 @@ import (
 )
 
 type ChatStreamOptions struct {
-	ResponseID string
-	Model      string
+	ResponseID  string
+	Model       string
+	OnUsage     func(Usage)
+	OnTextDelta func(string)
+}
+
+type Usage struct {
+	InputTokens  int `json:"input_tokens"`
+	OutputTokens int `json:"output_tokens"`
 }
 
 func AnthropicToOpenAIChatStream(r io.Reader, opts ChatStreamOptions) (string, error) {
@@ -93,6 +100,7 @@ func (s *anthropicChatState) handle(out flushWriter, event anthropicStreamEvent)
 		if event.Message.Model != "" {
 			s.opts.Model = event.Message.Model
 		}
+		s.emitUsage(event.Message.Usage)
 	case "content_block_start":
 		if event.ContentBlock.Type == "tool_use" {
 			empty := ""
@@ -119,6 +127,9 @@ func (s *anthropicChatState) handle(out flushWriter, event anthropicStreamEvent)
 		switch event.Delta.Type {
 		case "text_delta":
 			text := event.Delta.Text
+			if s.opts.OnTextDelta != nil && text != "" {
+				s.opts.OnTextDelta(text)
+			}
 			s.writeChunk(out, openai.ChatCompletionChunk{
 				ID:      s.opts.ResponseID,
 				Object:  "chat.completion.chunk",
@@ -145,6 +156,7 @@ func (s *anthropicChatState) handle(out flushWriter, event anthropicStreamEvent)
 			})
 		}
 	case "message_delta":
+		s.emitUsage(event.Usage)
 		s.stopReason = mapAnthropicStopReason(event.Delta.StopReason)
 		if s.stopReason != "" {
 			s.writeChunk(out, openai.ChatCompletionChunk{
@@ -156,6 +168,16 @@ func (s *anthropicChatState) handle(out flushWriter, event anthropicStreamEvent)
 			})
 		}
 	}
+}
+
+func (s *anthropicChatState) emitUsage(usage Usage) {
+	if s.opts.OnUsage == nil {
+		return
+	}
+	if usage.InputTokens == 0 && usage.OutputTokens == 0 {
+		return
+	}
+	s.opts.OnUsage(usage)
 }
 
 func (s *anthropicChatState) writeChunk(out flushWriter, chunk openai.ChatCompletionChunk) {
@@ -172,11 +194,13 @@ type anthropicStreamEvent struct {
 	Message      anthropicStreamMessage `json:"message"`
 	ContentBlock anthropicContentBlock  `json:"content_block"`
 	Delta        anthropicDelta         `json:"delta"`
+	Usage        Usage                  `json:"usage"`
 }
 
 type anthropicStreamMessage struct {
 	ID    string `json:"id"`
 	Model string `json:"model"`
+	Usage Usage  `json:"usage"`
 }
 
 type anthropicContentBlock struct {

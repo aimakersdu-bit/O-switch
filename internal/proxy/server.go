@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"baixin-switch/internal/audit"
 	"baixin-switch/internal/config"
 	"baixin-switch/internal/convert"
 	"baixin-switch/internal/limits"
@@ -27,6 +29,8 @@ type Server struct {
 	requestLimiter *limits.Limiter
 	streamLimiter  *limits.Limiter
 	logger         *slog.Logger
+	auditRecorder  *audit.Recorder
+	lastAuditStats audit.Stats
 }
 
 func NewServer(cfg config.Config) *Server {
@@ -39,6 +43,17 @@ func NewServerWithClient(cfg config.Config, client *http.Client) *Server {
 	if client == nil {
 		client = newUpstreamClient(cfg)
 	}
+	recorder, err := audit.NewRecorder(audit.Config{
+		Enabled:        cfg.AuditEnabled,
+		LogPath:        cfg.AuditLogPath,
+		CaptureBody:    cfg.AuditCaptureBody,
+		PreviewChars:   cfg.AuditPreviewChars,
+		QueueSize:      cfg.AuditQueueSize,
+		OverflowPolicy: cfg.AuditOverflowPolicy,
+	})
+	if err != nil {
+		slog.Default().Error("audit recorder disabled", "error", err)
+	}
 	s := &Server{
 		cfg:            cfg,
 		client:         client,
@@ -47,9 +62,19 @@ func NewServerWithClient(cfg config.Config, client *http.Client) *Server {
 		requestLimiter: limits.NewLimiter(cfg.MaxConcurrentRequests),
 		streamLimiter:  limits.NewLimiter(cfg.MaxConcurrentStreams),
 		logger:         slog.Default(),
+		auditRecorder:  recorder,
 	}
 	s.routes()
 	return s
+}
+
+func (s *Server) Close() {
+	if s == nil || s.auditRecorder == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = s.auditRecorder.Close(ctx)
 }
 
 func newUpstreamClient(cfg config.Config) *http.Client {
@@ -161,11 +186,17 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request) int {
+	start := time.Now()
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return http.StatusBadRequest
 	}
+	identity := audit.ResolveIdentity(r, body)
+	w.Header().Set("X-Request-ID", identity.RequestID)
+	w.Header().Set("X-Session-ID", identity.SessionID)
+	requestCapture := audit.CaptureBody(body, auditConfigFromServer(s))
+	baseEvent := s.newAuditEvent(identity, r.URL.Path, "/v1/messages", requestCapture, start)
 
 	anthropicReq, err := convert.OpenAIChatToAnthropic(body, convert.Options{
 		DefaultModel: s.cfg.DefaultModel,
@@ -173,18 +204,36 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	})
 	if err != nil {
 		s.metrics.IncConversionErrors("openai_chat_to_anthropic", "invalid_request")
+		baseEvent.Status = http.StatusBadRequest
+		baseEvent.ErrorCode = "invalid_request_error"
+		baseEvent.ErrorMessage = err.Error()
+		baseEvent.DurationMs = int(time.Since(start).Milliseconds())
+		s.recordAudit(baseEvent)
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return http.StatusBadRequest
 	}
+	baseEvent.Model = anthropicReq.Model
+	baseEvent.UpstreamModel = anthropicReq.Model
+	baseEvent.Stream = anthropicReq.Stream != nil && *anthropicReq.Stream
 	upstreamBody, err := json.Marshal(anthropicReq)
 	if err != nil {
 		s.metrics.IncConversionErrors("openai_chat_to_anthropic", "marshal")
+		baseEvent.Status = http.StatusBadRequest
+		baseEvent.ErrorCode = "invalid_request_error"
+		baseEvent.ErrorMessage = err.Error()
+		baseEvent.DurationMs = int(time.Since(start).Milliseconds())
+		s.recordAudit(baseEvent)
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return http.StatusBadRequest
 	}
 
 	upstreamReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, s.cfg.UpstreamBaseURL+"/v1/messages", bytes.NewReader(upstreamBody))
 	if err != nil {
+		baseEvent.Status = http.StatusBadGateway
+		baseEvent.ErrorCode = "upstream_request_error"
+		baseEvent.ErrorMessage = err.Error()
+		baseEvent.DurationMs = int(time.Since(start).Milliseconds())
+		s.recordAudit(baseEvent)
 		writeOpenAIError(w, http.StatusBadGateway, "upstream_request_error", err.Error())
 		return http.StatusBadGateway
 	}
@@ -200,15 +249,31 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 
 	resp, err := s.client.Do(upstreamReq)
 	if err != nil {
+		baseEvent.Status = http.StatusBadGateway
+		baseEvent.ErrorCode = "upstream_connection_error"
+		baseEvent.ErrorMessage = err.Error()
+		baseEvent.DurationMs = int(time.Since(start).Milliseconds())
+		s.recordAudit(baseEvent)
 		writeOpenAIError(w, http.StatusBadGateway, "upstream_connection_error", err.Error())
 		return http.StatusBadGateway
 	}
 	defer resp.Body.Close()
+	baseEvent.UpstreamStatus = resp.StatusCode
 
 	copyResponseHeaders(w.Header(), resp.Header)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		raw, _ := io.ReadAll(resp.Body)
+		responseCapture := audit.CaptureBody(raw, auditConfigFromServer(s))
+		baseEvent.ResponsePreview = responseCapture.Preview
+		baseEvent.ResponseBody = responseCapture.Body
+		baseEvent.Truncated = baseEvent.Truncated || responseCapture.Truncated
+		baseEvent.Redacted = baseEvent.Redacted || responseCapture.Redacted
+		baseEvent.Status = resp.StatusCode
+		baseEvent.DurationMs = int(time.Since(start).Milliseconds())
+		baseEvent.UsageSource = audit.UsageSourceMissing
+		s.recordAudit(baseEvent)
 		w.WriteHeader(resp.StatusCode)
-		_, _ = io.Copy(w, resp.Body)
+		_, _ = w.Write(raw)
 		return resp.StatusCode
 	}
 
@@ -224,26 +289,71 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		s.metrics.SetActiveStreams(int64(s.streamLimiter.InUse()))
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
+		var usage sse.Usage
+		var responseText strings.Builder
 		if err := sse.WriteAnthropicToOpenAIChatStream(w, resp.Body, sse.ChatStreamOptions{
 			Model: anthropicReq.Model,
+			OnUsage: func(next sse.Usage) {
+				usage.InputTokens += next.InputTokens
+				usage.OutputTokens += next.OutputTokens
+			},
+			OnTextDelta: func(delta string) {
+				responseText.WriteString(delta)
+			},
 		}); err != nil {
 			s.metrics.IncConversionErrors("anthropic_stream_to_openai_chat", "parse")
 			_, _ = fmt.Fprintf(w, "event: error\ndata: %s\n\n", jsonString(map[string]string{"message": err.Error()}))
+			baseEvent.ErrorCode = "upstream_stream_error"
+			baseEvent.ErrorMessage = err.Error()
 		}
+		responseCapture := audit.CaptureBody([]byte(responseText.String()), auditConfigFromServer(s))
+		baseEvent.Status = http.StatusOK
+		baseEvent.InputTokens = usage.InputTokens
+		baseEvent.OutputTokens = usage.OutputTokens
+		baseEvent.TotalTokens = usage.InputTokens + usage.OutputTokens
+		baseEvent.UsageSource = usageSource(baseEvent.InputTokens, baseEvent.OutputTokens)
+		baseEvent.ResponsePreview = responseCapture.Preview
+		baseEvent.ResponseBody = responseCapture.Body
+		baseEvent.Truncated = baseEvent.Truncated || responseCapture.Truncated
+		baseEvent.Redacted = baseEvent.Redacted || responseCapture.Redacted
+		baseEvent.DurationMs = int(time.Since(start).Milliseconds())
+		s.recordAudit(baseEvent)
 		return http.StatusOK
 	}
 
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
+		baseEvent.Status = http.StatusBadGateway
+		baseEvent.ErrorCode = "upstream_read_error"
+		baseEvent.ErrorMessage = err.Error()
+		baseEvent.DurationMs = int(time.Since(start).Milliseconds())
+		s.recordAudit(baseEvent)
 		writeOpenAIError(w, http.StatusBadGateway, "upstream_read_error", err.Error())
 		return http.StatusBadGateway
 	}
 	converted, err := convert.AnthropicToOpenAIChat(raw, "")
 	if err != nil {
 		s.metrics.IncConversionErrors("anthropic_to_openai_chat", "parse")
+		baseEvent.Status = http.StatusBadGateway
+		baseEvent.ErrorCode = "upstream_response_error"
+		baseEvent.ErrorMessage = err.Error()
+		baseEvent.DurationMs = int(time.Since(start).Milliseconds())
+		s.recordAudit(baseEvent)
 		writeOpenAIError(w, http.StatusBadGateway, "upstream_response_error", err.Error())
 		return http.StatusBadGateway
 	}
+	responseCapture := audit.CaptureBody(raw, auditConfigFromServer(s))
+	baseEvent.Status = http.StatusOK
+	baseEvent.InputTokens = converted.Usage.InputTokens
+	baseEvent.OutputTokens = converted.Usage.OutputTokens
+	baseEvent.TotalTokens = converted.Usage.TotalTokens
+	baseEvent.UsageSource = usageSource(baseEvent.InputTokens, baseEvent.OutputTokens)
+	baseEvent.ResponsePreview = responseCapture.Preview
+	baseEvent.ResponseBody = responseCapture.Body
+	baseEvent.Truncated = baseEvent.Truncated || responseCapture.Truncated
+	baseEvent.Redacted = baseEvent.Redacted || responseCapture.Redacted
+	baseEvent.DurationMs = int(time.Since(start).Milliseconds())
+	s.recordAudit(baseEvent)
 	writeJSON(w, http.StatusOK, converted)
 	return http.StatusOK
 }
@@ -295,6 +405,70 @@ func (s *Server) handleOpenAIPassthrough(w http.ResponseWriter, r *http.Request)
 
 	_, _ = io.Copy(w, resp.Body)
 	return resp.StatusCode
+}
+
+func auditConfigFromServer(s *Server) audit.Config {
+	return audit.Config{
+		Enabled:        s.cfg.AuditEnabled,
+		LogPath:        s.cfg.AuditLogPath,
+		CaptureBody:    s.cfg.AuditCaptureBody,
+		PreviewChars:   s.cfg.AuditPreviewChars,
+		QueueSize:      s.cfg.AuditQueueSize,
+		OverflowPolicy: s.cfg.AuditOverflowPolicy,
+	}
+}
+
+func (s *Server) newAuditEvent(identity audit.Identity, endpoint, upstreamEndpoint string, requestCapture audit.CapturedBody, start time.Time) audit.Event {
+	ts, date, week := audit.NewEventTime(start)
+	return audit.Event{
+		SchemaVersion:    1,
+		Timestamp:        ts,
+		Date:             date,
+		Week:             week,
+		RequestID:        identity.RequestID,
+		SessionID:        identity.SessionID,
+		Mode:             s.cfg.Mode,
+		Endpoint:         endpoint,
+		UpstreamEndpoint: upstreamEndpoint,
+		RequestPreview:   requestCapture.Preview,
+		RequestBody:      requestCapture.Body,
+		Truncated:        requestCapture.Truncated,
+		Redacted:         requestCapture.Redacted,
+		UsageSource:      audit.UsageSourceMissing,
+	}
+}
+
+func (s *Server) recordAudit(event audit.Event) {
+	if s.auditRecorder == nil {
+		return
+	}
+	s.auditRecorder.Record(event)
+	stats := s.auditRecorder.Stats()
+	s.metrics.SetAuditQueueDepth(int64(stats.QueueDepth))
+	s.syncAuditMetricDeltas(stats)
+	s.metrics.AddTokens(event.InputTokens, event.OutputTokens)
+}
+
+func (s *Server) syncAuditMetricDeltas(stats audit.Stats) {
+	addDelta := func(current, previous uint64, result string) {
+		if current <= previous {
+			return
+		}
+		for i := previous; i < current; i++ {
+			s.metrics.IncAuditEvents(result)
+		}
+	}
+	addDelta(stats.Written, s.lastAuditStats.Written, "written")
+	addDelta(stats.Dropped, s.lastAuditStats.Dropped, "dropped")
+	addDelta(stats.SyncWrites, s.lastAuditStats.SyncWrites, "sync")
+	s.lastAuditStats = stats
+}
+
+func usageSource(input, output int) string {
+	if input == 0 && output == 0 {
+		return audit.UsageSourceMissing
+	}
+	return audit.UsageSourceUpstream
 }
 
 func copyForwardHeaders(dst, src http.Header) {

@@ -1,10 +1,13 @@
 package proxy
 
 import (
+	"bufio"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -12,7 +15,7 @@ import (
 )
 
 func TestHealth(t *testing.T) {
-	srv := NewServer(config.Config{ListenAddr: "127.0.0.1:0"})
+	srv := NewServer(noAuditConfig(config.Config{ListenAddr: "127.0.0.1:0"}))
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)
 	rec := httptest.NewRecorder()
 
@@ -27,7 +30,7 @@ func TestHealth(t *testing.T) {
 }
 
 func TestHealthzReadyzAndMetrics(t *testing.T) {
-	srv := NewServer(config.Config{ListenAddr: "127.0.0.1:0", UpstreamBaseURL: "http://upstream.test"})
+	srv := NewServer(noAuditConfig(config.Config{ListenAddr: "127.0.0.1:0", UpstreamBaseURL: "http://upstream.test"}))
 
 	for _, path := range []string{"/healthz", "/readyz"} {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
@@ -88,6 +91,8 @@ func TestChatCompletionsAnthropicModeConvertsNonStreamRequestAndResponse(t *test
 		UpstreamBaseURL: "http://anthropic.test",
 		UpstreamAPIKey:  "upstream-key",
 		DefaultModel:    "deepseek-v4-pro",
+		AuditEnabled:    false,
+		AuditLogPath:    "disabled",
 	}, &http.Client{Transport: upstream})
 
 	reqBody := `{
@@ -129,6 +134,155 @@ func TestChatCompletionsAnthropicModeConvertsNonStreamRequestAndResponse(t *test
 	}
 }
 
+func TestChatCompletionsAnthropicModeWritesNonStreamAuditEvent(t *testing.T) {
+	auditPath := filepath.Join(t.TempDir(), "usage.jsonl")
+	upstream := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		body := `{"id":"msg_1","type":"message","role":"assistant","model":"deepseek-v4-pro","content":[{"type":"text","text":"hello secret"}],"stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":2}}`
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(body)),
+		}, nil
+	})
+
+	srv := NewServerWithClient(config.Config{
+		Mode:                "anthropic_messages",
+		UpstreamBaseURL:     "http://anthropic.test",
+		DefaultModel:        "deepseek-v4-pro",
+		AuditEnabled:        true,
+		AuditLogPath:        auditPath,
+		AuditCaptureBody:    "preview",
+		AuditPreviewChars:   2000,
+		AuditQueueSize:      1,
+		AuditOverflowPolicy: "sync",
+	}, &http.Client{Transport: upstream})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"metadata":{"session_id":"sess-body"},"messages":[{"role":"user","content":"hello"}],"api_key":"sk-secret"}`))
+	req.Header.Set("X-Request-ID", "req-1")
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+	srv.Close()
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("X-Request-ID") != "req-1" {
+		t.Fatalf("expected X-Request-ID response header, got %q", rec.Header().Get("X-Request-ID"))
+	}
+	if rec.Header().Get("X-Session-ID") != "sess-body" {
+		t.Fatalf("expected X-Session-ID response header, got %q", rec.Header().Get("X-Session-ID"))
+	}
+
+	event := readSingleAuditEvent(t, auditPath)
+	if event["request_id"] != "req-1" || event["session_id"] != "sess-body" {
+		t.Fatalf("unexpected ids in audit event: %#v", event)
+	}
+	if event["input_tokens"].(float64) != 3 || event["output_tokens"].(float64) != 2 || event["total_tokens"].(float64) != 5 {
+		t.Fatalf("unexpected tokens: %#v", event)
+	}
+	if !strings.Contains(event["response_preview"].(string), "hello secret") {
+		t.Fatalf("expected response preview, got %#v", event["response_preview"])
+	}
+	if strings.Contains(event["request_preview"].(string), "sk-secret") {
+		t.Fatalf("request preview leaked secret: %s", event["request_preview"])
+	}
+}
+
+func TestChatCompletionsAnthropicModeWritesStreamAuditEvent(t *testing.T) {
+	auditPath := filepath.Join(t.TempDir(), "usage.jsonl")
+	upstream := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		body := strings.Join([]string{
+			`event: message_start`,
+			`data: {"type":"message_start","message":{"id":"msg_1","model":"deepseek-v4-pro","usage":{"input_tokens":5}}}`,
+			``,
+			`event: content_block_delta`,
+			`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}`,
+			``,
+			`event: message_delta`,
+			`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}`,
+			``,
+		}, "\n")
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader(body)),
+		}, nil
+	})
+
+	srv := NewServerWithClient(config.Config{
+		Mode:                "anthropic_messages",
+		UpstreamBaseURL:     "http://anthropic.test",
+		DefaultModel:        "deepseek-v4-pro",
+		AuditEnabled:        true,
+		AuditLogPath:        auditPath,
+		AuditCaptureBody:    "preview",
+		AuditPreviewChars:   2000,
+		AuditQueueSize:      1,
+		AuditOverflowPolicy: "sync",
+	}, &http.Client{Transport: upstream})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"messages":[{"role":"user","content":"hello"}],"stream":true}`))
+	req.Header.Set("X-Session-ID", "sess-stream")
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+	srv.Close()
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	event := readSingleAuditEvent(t, auditPath)
+	if event["session_id"] != "sess-stream" {
+		t.Fatalf("unexpected session id: %#v", event)
+	}
+	if event["input_tokens"].(float64) != 5 || event["output_tokens"].(float64) != 2 {
+		t.Fatalf("unexpected stream tokens: %#v", event)
+	}
+	if event["response_preview"].(string) != "hi" {
+		t.Fatalf("expected stream response preview hi, got %#v", event["response_preview"])
+	}
+}
+
+func TestChatCompletionsAnthropicModeWritesFailedAuditEvent(t *testing.T) {
+	auditPath := filepath.Join(t.TempDir(), "usage.jsonl")
+	upstream := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusBadGateway,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"error":"bad upstream"}`)),
+		}, nil
+	})
+
+	srv := NewServerWithClient(config.Config{
+		Mode:                "anthropic_messages",
+		UpstreamBaseURL:     "http://anthropic.test",
+		DefaultModel:        "deepseek-v4-pro",
+		AuditEnabled:        true,
+		AuditLogPath:        auditPath,
+		AuditCaptureBody:    "preview",
+		AuditQueueSize:      1,
+		AuditOverflowPolicy: "sync",
+	}, &http.Client{Transport: upstream})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"messages":[{"role":"user","content":"hello"}]}`))
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+	srv.Close()
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("expected 502, got %d: %s", rec.Code, rec.Body.String())
+	}
+	event := readSingleAuditEvent(t, auditPath)
+	if event["status"].(float64) != 502 || event["upstream_status"].(float64) != 502 {
+		t.Fatalf("expected failed status in audit event: %#v", event)
+	}
+	if event["usage_source"] != "missing" {
+		t.Fatalf("expected missing usage source, got %#v", event["usage_source"])
+	}
+}
+
 func TestChatCompletionsAnthropicModeConvertsStreamResponse(t *testing.T) {
 	upstream := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if r.URL.Path != "/v1/messages" {
@@ -157,6 +311,8 @@ func TestChatCompletionsAnthropicModeConvertsStreamResponse(t *testing.T) {
 		UpstreamBaseURL: "http://anthropic.test",
 		UpstreamAPIKey:  "upstream-key",
 		DefaultModel:    "deepseek-v4-pro",
+		AuditEnabled:    false,
+		AuditLogPath:    "disabled",
 	}, &http.Client{Transport: upstream})
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"deepseek-v4-pro","messages":[{"role":"user","content":"hello"}],"stream":true}`))
@@ -188,6 +344,8 @@ func TestChatCompletionsReturns429WhenRequestLimitExceeded(t *testing.T) {
 		Mode:                  "anthropic_messages",
 		UpstreamBaseURL:       "http://anthropic.test",
 		MaxConcurrentRequests: 1,
+		AuditEnabled:          false,
+		AuditLogPath:          "disabled",
 	}, &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		return &http.Response{
 			StatusCode: http.StatusOK,
@@ -237,6 +395,8 @@ func TestChatCompletionsProxyNormalizesOneShotToolCallStream(t *testing.T) {
 		UpstreamAPIKey:        "upstream-key",
 		ToolCallStreamShim:    true,
 		ToolCallArgumentChunk: 5,
+		AuditEnabled:          false,
+		AuditLogPath:          "disabled",
 	}, &http.Client{Transport: upstream})
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"stream":true}`))
@@ -270,4 +430,32 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (fn roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
 	return fn(r)
+}
+
+func noAuditConfig(cfg config.Config) config.Config {
+	cfg.AuditEnabled = false
+	cfg.AuditLogPath = "disabled"
+	return cfg
+}
+
+func readSingleAuditEvent(t *testing.T, path string) map[string]any {
+	t.Helper()
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	if !scanner.Scan() {
+		t.Fatalf("expected one audit line")
+	}
+	var event map[string]any
+	if err := json.Unmarshal(scanner.Bytes(), &event); err != nil {
+		t.Fatalf("invalid audit json: %v", err)
+	}
+	if scanner.Scan() {
+		t.Fatalf("expected exactly one audit line")
+	}
+	return event
 }

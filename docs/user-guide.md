@@ -44,6 +44,13 @@ API Key：
 - 如果不传，服务端使用 `DEFAULT_MODEL`；
 - 如需把客户端模型名改成上游模型名，用 `MODEL_MAP`。
 
+会话 ID：
+
+- 推荐客户端传 `X-Session-ID`；
+- 也可以传 `X-Conversation-ID`；
+- 如果请求 body 中有 `metadata.session_id`，也会用于会话归因；
+- 返回响应会带上 `X-Request-ID` 和 `X-Session-ID`。
+
 ## 3. 支持的接口
 
 ### 健康检查
@@ -92,6 +99,7 @@ POST /v1/chat/completions
 curl -sS http://127.0.0.1:11435/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -H 'Authorization: Bearer dummy' \
+  -H 'X-Session-ID: sess_demo_001' \
   -d '{
     "model": "deepseek-v4-pro",
     "messages": [
@@ -206,8 +214,65 @@ Model: deepseek-v4-pro
 3. 发起一次普通对话，确认非流式响应正常。
 4. 发起一次工具调用任务，确认 Comate 能收到工具调用、执行工具、继续后续对话。
 5. 查看 `/metrics` 和服务日志，确认没有 conversion error。
+6. 如果客户端支持自定义 header，建议传入稳定的 `X-Session-ID`，便于按会话查看模型请求与响应。
 
-## 8. 兼容旧 DS Pro OpenAI passthrough
+## 8. 会话观测和 token 统计
+
+默认开启 JSONL 审计：
+
+```text
+./logs/usage.jsonl
+```
+
+可通过 `AUDIT_LOG_DIR` 修改存储目录，例如 `AUDIT_LOG_DIR=/var/log/baixin-switch`；如需精确指定文件路径，可以使用 `AUDIT_LOG_PATH`。
+
+默认保存：
+
+- request/session id
+- 模型名
+- 状态码和耗时
+- input/output/total tokens
+- 脱敏截断后的请求/响应预览
+
+按天统计：
+
+```bash
+./scripts/usage_report.sh --by day
+```
+
+按周统计：
+
+```bash
+./scripts/usage_report.sh --by week
+```
+
+按会话汇总：
+
+```bash
+./scripts/usage_report.sh --by session
+```
+
+查看某个会话的模型请求/响应时间线：
+
+```bash
+./scripts/usage_report.sh --session sess_demo_001
+```
+
+输出 JSON：
+
+```bash
+./scripts/usage_report.sh --by day --json
+```
+
+正文采集模式：
+
+```bash
+AUDIT_CAPTURE_BODY=off      # 只记录元数据和 token
+AUDIT_CAPTURE_BODY=preview  # 默认，脱敏截断预览
+AUDIT_CAPTURE_BODY=full     # 脱敏完整正文，谨慎开启
+```
+
+## 9. 兼容旧 DS Pro OpenAI passthrough
 
 如果你的上游仍是 OpenAI-compatible `/v1/chat/completions`，并且只需要修复 DS Pro 一次性 tool call SSE，可以用：
 
@@ -226,7 +291,7 @@ Comate / OpenAI-compatible client
 
 如果上游已经像 GLM 5.1 一样逐段返回 `function.arguments`，代理会原样透传。
 
-## 9. 常用调试方法
+## 10. 常用调试方法
 
 检查服务：
 
@@ -259,11 +324,14 @@ curl -sS "$UPSTREAM_BASE_URL/v1/messages" \
 4. `UPSTREAM_BASE_URL` 是否不带 `/v1/messages`。
 5. `UPSTREAM_API_KEY` 是否正确。
 6. `/metrics` 是否出现 `baixin_conversion_errors_total` 增长。
-7. 服务日志里的 `status`、`duration_ms`、`mode` 是否符合预期。
+7. `/metrics` 是否出现 `baixin_audit_events_total` 和 `baixin_tokens_total` 增长。
+8. `./logs/usage.jsonl` 是否有对应 `session_id` 的记录。
+9. 服务日志里的 `status`、`duration_ms`、`mode` 是否符合预期。
 
-## 10. 当前限制
+## 11. 当前限制
 
 - 不做客户端 API Key 校验。
 - 暂不支持 `/v1/responses`。
 - 暂不支持多上游自动故障转移。
 - Anthropic SSE 主路径已经边读边写；旧 `openai_passthrough` DS Pro shim 仍会缓存完整上游 SSE 再输出，后续可以继续改造成 writer 流式。
+- JSONL 报表适合单机文件扫描；超大规模长期统计后续可迁移到 SQLite 或 PostgreSQL。

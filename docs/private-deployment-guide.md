@@ -17,6 +17,8 @@ Comate / OpenAI-compatible client
 - OpenAI tools/tool_choice/tool messages 与 Anthropic tool_use/tool_result 转换
 - `/healthz`、`/readyz`、`/metrics`
 - JSON access log
+- 会话级 JSONL 审计日志，默认脱敏/截断请求与响应预览
+- token 使用统计脚本，支持按天、周、会话聚合
 - 单实例进程内并发限流，默认 1000 active requests / 1000 active streams
 - `MODE=openai_passthrough` 兼容旧 DS Pro OpenAI-compatible 流式工具调用修正
 
@@ -25,7 +27,7 @@ Comate / OpenAI-compatible client
 - `/v1/responses`
 - 多上游自动故障转移
 - 内置客户端鉴权
-- 请求正文落库审计
+- 数据库审计后台和可视化管理台
 
 ## 2. 环境要求
 
@@ -54,6 +56,13 @@ Docker 部署：
 | `MAX_CONCURRENT_REQUESTS` | `1000` | 否 | 单进程 active request 上限，超出返回 429。 |
 | `MAX_CONCURRENT_STREAMS` | `1000` | 否 | 单进程 active stream 上限，超出返回 429。 |
 | `REQUEST_TIMEOUT_SECONDS` | `600` | 否 | 上游请求超时。 |
+| `AUDIT_ENABLED` | `true` | 否 | 是否写入会话审计 JSONL。 |
+| `AUDIT_LOG_DIR` | `./logs` | 否 | 审计和用量 JSONL 存储目录，默认文件名为 `usage.jsonl`。 |
+| `AUDIT_LOG_PATH` | 根据 `AUDIT_LOG_DIR` 生成 | 否 | 高级配置：精确指定 JSONL 文件路径，优先级高于 `AUDIT_LOG_DIR`。 |
+| `AUDIT_CAPTURE_BODY` | `preview` | 否 | `off`、`preview`、`full`。默认脱敏截断；`full` 也会脱敏但会保存完整正文。 |
+| `AUDIT_PREVIEW_CHARS` | `2000` | 否 | 请求/响应预览最大字符数。 |
+| `AUDIT_QUEUE_SIZE` | `8192` | 否 | 异步审计队列大小。 |
+| `AUDIT_OVERFLOW_POLICY` | `drop` | 否 | 队列满时 `drop` 丢弃审计事件，`sync` 同步写入。 |
 | `TOOL_CALL_STREAM_SHIM` | `true` | 否 | 仅 `openai_passthrough` 使用。 |
 | `TOOL_CALL_ARGUMENT_CHUNK_SIZE` | `16` | 否 | 仅 `openai_passthrough` 使用。 |
 
@@ -75,6 +84,9 @@ export UPSTREAM_API_KEY="sk-..."
 export DEFAULT_MODEL="deepseek-v4-pro"
 export MAX_CONCURRENT_REQUESTS="1000"
 export MAX_CONCURRENT_STREAMS="1000"
+export AUDIT_ENABLED="true"
+export AUDIT_LOG_DIR="./logs"
+export AUDIT_CAPTURE_BODY="preview"
 ./baixin-switch
 ```
 
@@ -109,6 +121,10 @@ docker run -d \
   -e DEFAULT_MODEL=deepseek-v4-pro \
   -e MAX_CONCURRENT_REQUESTS=1000 \
   -e MAX_CONCURRENT_STREAMS=1000 \
+  -e AUDIT_ENABLED=true \
+  -e AUDIT_LOG_DIR=/var/log/baixin-switch \
+  -e AUDIT_CAPTURE_BODY=preview \
+  -v "$(pwd)/logs:/var/log/baixin-switch" \
   baixin-switch:latest
 ```
 
@@ -138,6 +154,11 @@ services:
       MAX_CONCURRENT_REQUESTS: "1000"
       MAX_CONCURRENT_STREAMS: "1000"
       REQUEST_TIMEOUT_SECONDS: "600"
+      AUDIT_ENABLED: "true"
+      AUDIT_LOG_DIR: "/var/log/baixin-switch"
+      AUDIT_CAPTURE_BODY: "preview"
+    volumes:
+      - ./logs:/var/log/baixin-switch
 ```
 
 启动：
@@ -166,6 +187,10 @@ DEFAULT_MODEL=deepseek-v4-pro
 MAX_CONCURRENT_REQUESTS=1000
 MAX_CONCURRENT_STREAMS=1000
 REQUEST_TIMEOUT_SECONDS=600
+AUDIT_ENABLED=true
+AUDIT_LOG_DIR=/var/log/baixin-switch
+AUDIT_CAPTURE_BODY=preview
+AUDIT_PREVIEW_CHARS=2000
 ```
 
 创建 `/etc/systemd/system/baixin-switch.service`：
@@ -276,10 +301,57 @@ curl -sS http://127.0.0.1:11435/metrics | grep baixin
 
 - `baixin_http_requests_total`
 - `baixin_conversion_errors_total`
+- `baixin_audit_events_total`
+- `baixin_audit_queue_depth`
+- `baixin_tokens_total`
 - `baixin_active_requests`
 - `baixin_active_streams`
 
-## 10. 1000 并发建议
+## 10. 会话观测和 token 统计
+
+默认审计文件：
+
+```text
+./logs/usage.jsonl
+```
+
+每个模型请求写入一行 JSON，包含：
+
+- `request_id`
+- `session_id`
+- `model`
+- `status`
+- `input_tokens`、`output_tokens`、`total_tokens`
+- 脱敏截断后的 `request_preview` 和 `response_preview`
+
+客户端建议传入：
+
+```text
+X-Session-ID: <业务会话 ID>
+```
+
+统计命令：
+
+```bash
+./scripts/usage_report.sh --file ./logs/usage.jsonl --by day
+./scripts/usage_report.sh --file ./logs/usage.jsonl --by week
+./scripts/usage_report.sh --file ./logs/usage.jsonl --by session
+./scripts/usage_report.sh --file ./logs/usage.jsonl --session sess_abc
+```
+
+输出 JSON：
+
+```bash
+./scripts/usage_report.sh --file ./logs/usage.jsonl --by day --json
+```
+
+隐私说明：
+
+- `AUDIT_CAPTURE_BODY=preview` 是生产推荐值。
+- `AUDIT_CAPTURE_BODY=full` 会保存完整请求/响应正文，虽然仍会脱敏 token、password、authorization 等字段，但仍可能包含用户 prompt 和模型输出，开启前需要明确运维和合规风险。
+- 如果只需要 token 统计，不需要正文，设置 `AUDIT_CAPTURE_BODY=off`。
+
+## 11. 1000 并发建议
 
 单实例 1000 并发可行性取决于上游延迟、流式请求占比、机器文件描述符和网络带宽。当前实现已经做了：
 
@@ -287,6 +359,7 @@ curl -sS http://127.0.0.1:11435/metrics | grep baixin
 - active stream limiter 默认 1000
 - 上游 HTTP connection pool 按并发上限配置
 - Anthropic SSE 主路径边读边写，不缓存完整流
+- 审计日志异步有界队列写入，默认队列满时丢弃审计事件以保护请求延迟
 
 上线前建议：
 

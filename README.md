@@ -46,6 +46,13 @@ http://127.0.0.1:11435/v1
 | `TOOL_CALL_STREAM_SHIM` | `true` | Only used in `openai_passthrough`; rewrites one-shot tool-call arguments into incremental deltas. |
 | `TOOL_CALL_ARGUMENT_CHUNK_SIZE` | `16` | Rune count per emitted argument delta in passthrough shim mode. |
 | `REQUEST_TIMEOUT_SECONDS` | `600` | Upstream request timeout. |
+| `AUDIT_ENABLED` | `true` | Write one JSONL audit event per model call. |
+| `AUDIT_LOG_DIR` | `./logs` | Directory for usage/audit JSONL storage. The default file is `usage.jsonl`. |
+| `AUDIT_LOG_PATH` | derived from `AUDIT_LOG_DIR` | Advanced override for the exact JSONL file path. Takes precedence over `AUDIT_LOG_DIR`. |
+| `AUDIT_CAPTURE_BODY` | `preview` | `off`, `preview`, or `full`. Preview/full are redacted; full body capture is opt-in. |
+| `AUDIT_PREVIEW_CHARS` | `2000` | Max preview rune count. |
+| `AUDIT_QUEUE_SIZE` | `8192` | Async audit queue size. |
+| `AUDIT_OVERFLOW_POLICY` | `drop` | `drop` protects latency; `sync` protects audit completeness. |
 
 ## Supported Endpoints
 
@@ -64,6 +71,27 @@ POST /v1/chat/completions
 
 Supported Chat fields include `messages`, `tools`, `tool_choice`, `max_tokens`, `max_completion_tokens`, `temperature`, `top_p`, `stop`, and `stream`.
 
+## Session Observability
+
+By default, `baixin-switch` writes redacted and truncated request/response previews to:
+
+```text
+./logs/usage.jsonl
+```
+
+Session id is resolved from `X-Session-ID`, `X-Conversation-ID`, body `metadata.session_id`, or `X-Request-ID`. Responses include `X-Request-ID` and `X-Session-ID`.
+
+Usage reports:
+
+```bash
+./scripts/usage_report.sh --by day
+./scripts/usage_report.sh --by week
+./scripts/usage_report.sh --by session
+./scripts/usage_report.sh --session sess_abc
+```
+
+Use `AUDIT_CAPTURE_BODY=full` only when operators explicitly accept prompt/output storage risk.
+
 ## Tests
 
 ```bash
@@ -74,12 +102,15 @@ GOCACHE="$(pwd)/.cache/go-build" go test ./...
 
 The analysis, design notes, manuals, and implementation plans are kept in the project for ongoing development:
 
+- [CHANGELOG.md](CHANGELOG.md)
 - [docs/analysis-and-design.md](docs/analysis-and-design.md)
 - [docs/openai-to-anthropic-observability-concurrency-design.md](docs/openai-to-anthropic-observability-concurrency-design.md)
 - [docs/private-deployment-guide.md](docs/private-deployment-guide.md)
 - [docs/user-guide.md](docs/user-guide.md)
+- [docs/session-observability-jsonl-design.md](docs/session-observability-jsonl-design.md)
 - [docs/plans/2026-06-12-baixin-switch-proxy.md](docs/plans/2026-06-12-baixin-switch-proxy.md)
 - [docs/plans/2026-06-12-openai-anthropic-production-gateway.md](docs/plans/2026-06-12-openai-anthropic-production-gateway.md)
+- [docs/plans/2026-06-12-session-observability-jsonl.md](docs/plans/2026-06-12-session-observability-jsonl.md)
 
 ## Docker
 
